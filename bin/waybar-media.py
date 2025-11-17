@@ -14,8 +14,17 @@ from pydbus import SessionBus
 MPRIS_PLAYER_OBJ_PATH = '/org/mpris/MediaPlayer2'
 MPRIS_PLAYER_IFACE = 'org.mpris.MediaPlayer2.Player'
 KNOWN_SERVICES = [
+    'org.mpris.MediaPlayer2.spotify',
     'org.mpris.MediaPlayer2.mpv',
     'org.kde.plasma.browser_integration'
+]
+
+PRIORITY_ORDER = [
+    'spotify',
+    'mpv', 
+    'Firefox',
+    'Chromium',
+    'Google Chrome'
 ]
 KNOWN_BROWSER_MAP = {
     'mozilla': 'Firefox',
@@ -125,30 +134,70 @@ class MediaWatcher:
         for service in KNOWN_SERVICES:
             try:
                 owner_name = self._bus.dbus.GetNameOwner(service)
+                owner_to_player[owner_name] = Player(bus=self._bus, owner_name=owner_name)
             except GLib.Error:
                 continue
-            owner_to_player[owner_name] = Player(bus=self._bus, owner_name=owner_name)
         return owner_to_player
 
+    def _cleanup_dead_players(self):
+        """Remove players that are no longer available"""
+        dead_owners = []
+        for owner_name in self._owner_to_player:
+            try:
+                # Try to access the player to see if it's still alive
+                self._owner_to_player[owner_name].status
+            except:
+                # Player is dead, mark for removal
+                dead_owners.append(owner_name)
+        
+        for owner_name in dead_owners:
+            del self._owner_to_player[owner_name]
+
     def _group_players_by_status(self):
+        # Clean up dead players first
+        self._cleanup_dead_players()
+        
         status_to_players = {}
         for player in self._owner_to_player.values():
-            if player.status in status_to_players:
-                status_to_players[player.status].append(player)
-            else:
-                status_to_players[player.status] = [player]
+            try:
+                status = player.status
+                if status in status_to_players:
+                    status_to_players[status].append(player)
+                else:
+                    status_to_players[status] = [player]
+            except:
+                # Player is dead, will be cleaned up next time
+                continue
         return status_to_players
 
     def _find_active_player(self):
         players_by_status = self._group_players_by_status()
 
+        # Filter out playerctld if there are real players available
+        def filter_real_players(players):
+            real_players = [p for p in players if p.name != 'playerctld']
+            return real_players if real_players else players
+
+        # Sort by priority order defined in PRIORITY_ORDER
+        def get_priority(player):
+            name = player.name.lower() if player.name else ''
+            try:
+                return PRIORITY_ORDER.index(name)
+            except ValueError:
+                return len(PRIORITY_ORDER)  # Put unknown players at the end
+
         if players_by_status.get('playing'):
-            players_by_status['playing'].sort(key=lambda x: x.owner_process.create_time(), reverse=True)
-            return players_by_status['playing'][0]
+            real_playing = filter_real_players(players_by_status['playing'])
+            real_playing.sort(key=get_priority)
+            return real_playing[0] if real_playing else None
         elif players_by_status.get('paused'):
-            return players_by_status['paused'][0]
+            real_paused = filter_real_players(players_by_status['paused'])
+            real_paused.sort(key=get_priority)
+            return real_paused[0] if real_paused else None
         elif players_by_status.get('stopped'):
-            return players_by_status['stopped'][0]
+            real_stopped = filter_real_players(players_by_status['stopped'])
+            real_stopped.sort(key=get_priority)
+            return real_stopped[0] if real_stopped else None
 
         return None
 
@@ -167,9 +216,11 @@ class MediaWatcherStatusBuilder:
         self.watcher = watcher
 
     def _build_tooltip(self):
-        tooltip = []
         player = self.watcher.player
-
+        if player is None:
+            return ""
+            
+        tooltip = []
         if player.status in ['playing', 'paused']:
             tooltip.append(player.status.title() + ':')
         if player.title:
@@ -181,42 +232,39 @@ class MediaWatcherStatusBuilder:
         if player.name:
             tooltip.append('(' + player.name + ')')
 
-        return '\n'.join(tooltip) if tooltip else None
+        return '\n'.join(tooltip) if tooltip else ""
 
     def _build_text(self, max_width, title_to_artist_ratio=2 / 3, separator=' - ', placeholder='…'):
-        max_width = max_width - len(separator)
         player = self.watcher.player
+        if player is None:
+            return ""
 
-        if player.title and player.artist:
-            title_width = math.floor(max_width * title_to_artist_ratio)
-            artist_width = max_width - title_width
-        elif player.title and not player.artist:
-            title_width = max_width
-            artist_width = 0
-        elif player.artist and not player.title:
-            title_width = 0
-            artist_width = max_width
+        # Try title only first
+        if player.title:
+            title_only = textwrap.shorten(player.title, width=max_width, placeholder=placeholder)
+            
+            # If we have room for title + artist, include both
+            if player.artist and len(player.title) + len(separator) + len(player.artist) <= max_width:
+                title_width = math.floor((max_width - len(separator)) * title_to_artist_ratio)
+                artist_width = max_width - len(separator) - title_width
+                
+                short_title = textwrap.shorten(player.title, width=title_width, placeholder=placeholder)
+                short_artist = textwrap.shorten(player.artist, width=artist_width, placeholder=placeholder)
+                return separator.join((short_title, short_artist))
+            else:
+                # Just show title if artist won't fit
+                return title_only
+        elif player.artist:
+            return textwrap.shorten(player.artist, width=max_width, placeholder=placeholder)
         else:
-            return None
-
-        short_title = (
-            None if title_width == 0 else textwrap.shorten(player.title, width=title_width, placeholder=placeholder)
-        )
-        short_artist = (
-            None if artist_width == 0 else textwrap.shorten(player.artist, width=artist_width, placeholder=placeholder)
-        )
-
-        if short_title and short_artist:
-            return separator.join((short_title, short_artist))
-        elif short_title and not short_artist:
-            return short_title
-        elif short_artist and not short_title:
-            return short_artist
+            return ""
 
     def _build_classes(self):
-        classes = []
         player = self.watcher.player
-
+        if player is None:
+            return []
+            
+        classes = []
         if player.status in ['playing', 'paused']:
             classes.append(player.status)
         else:
@@ -225,6 +273,9 @@ class MediaWatcherStatusBuilder:
         return classes
 
     def build_status(self):
+        if self.watcher.player is None:
+            return json.dumps({'tooltip': '', 'text': '', 'class': ['stopped']})
+        
         return json.dumps(
             {'tooltip': self._build_tooltip(), 'text': self._build_text(max_width=80), 'class': self._build_classes()}
         )
